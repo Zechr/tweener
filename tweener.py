@@ -96,15 +96,18 @@ def max_pool_2x2(x):
     return tf.nn.max_pool(x, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
 
 def next_batch(size):
-    global current
-    if current + size >= len(shist[0]):
-        current = 0
-    temp = current
-    current += size
-    return {'x_s': np.array(shist[0][temp:temp+size], dtype=object), 'x_e': np.array(shist[1][temp:temp+size], dtype=object), 
-    'y': np.array(shist[2][temp:temp+size], dtype=object), 'org_l': np.array(shist[3][temp:temp+size])}
-    #return {'x': np.array(random.sample(shist[0], size), dtype=object), 'y': np.array(random.sample(shist[1], size), dtype=object),
-    #'x_org': np.array(random.sample(shist[2], size), dtype=object), 'org_l': np.array(random.sample(shist[3], size), dtype=object)}
+    indices = random.sample(range(len(shist[0])), size)
+    x_s = []
+    x_e = []
+    y = []
+    org_l = []
+    for index in indices:
+        x_s.append(shist[0][index])
+        x_e.append(shist[1][index])
+        y.append(shist[2][index])
+        org_l.append(shist[3][index])
+    return {'x_s': np.array(x_s, dtype=object), 'x_e': np.array(x_e, dtype=object), 
+    'y': np.array(y, dtype=object), 'org_l': np.array(org_l)}
 
 W_conv0 = weight_variable([5, 5, 1, 8])
 b_conv0 = bias_variable([8])
@@ -155,7 +158,50 @@ y_conv = tf.reshape(tf.nn.relu(conv2d(h_depool2, W_reconv0) + b_reconv0), [-1, O
 keep_prob = tf.placeholder(tf.float32)
 
 loss = tf.reduce_mean(tf.divide(tf.reduce_sum(tf.square(tf.subtract(y_, y_conv)), axis=1), org_loss))
+
+
+#Discriminator network
+x = tf.placeholder(tf.float32, shape=[None, INPUT_DIM])
+#binary classification
+y_class = tf.placeholder(tf.float32, shape=[None, 2])
+
+W_d_conv0 = weight_variable([5, 5, 1, 8])
+b_d_conv0 = bias_variable([8])
+
+h_d_conv0 = tf.nn.relu(conv2d(x, W_d_conv0) + b_d_conv0)
+h_d_pool0 = max_pool_2x2(h_d_conv0)
+
+W_d_conv1 = weight_variable([3, 3, 8, 16])
+b_d_conv1 = bias_variable([16])
+
+h_d_conv1 = tf.nn.relu(conv2d(h_d_pool0, W_d_conv1) + b_d_conv1)
+h_d_pool1 = max_pool_2x2(h_d_conv1)
+
+W_d_conv2 = weight_variable([3, 3, 16, 32])
+b_d_conv2 = bias_variable([32])
+
+h_d_conv2 = tf.nn.relu(conv2d(h_d_pool1, W_d_conv2) + b_d_conv2)
+
+h_d_r = tf.reshape(h_d_conv2, [-1, WIDTH/4 * HEIGHT/4 * 32])
+W_d_fc0 = weight_variable([WIDTH/4 * HEIGHT/4 * 32, 1024])
+b_d_fc0 = bias_variable([1024])
+
+h_d_fc0 = tf.nn.relu(tf.matmul(h_d_r, W_d_fc0) + b_d_fc0)
+
+W_d_fc1 = weight_variable([1024, 2])
+b_d_fc1 = bias_variable([2])
+
+out = tf.matmul(h_d_fc0, W_d_fc1) + b_d_fc1
+
+#discriminator loss
+cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_class, logits=out))
+train_step_d = tf.train.AdamOptimizer(0.001).minimize(cross_entropy)
+
+#generator loss with discriminator loss included
+loss_with_d = loss - 0.2*cross_entropy
 train_step = tf.train.AdamOptimizer(0.001).minimize(loss)
+
+
 sess = tf.InteractiveSession()
 saver = tf.train.Saver()
 
@@ -167,6 +213,9 @@ if rerun == 1:
 
 
 accuracy = tf.reduce_mean(tf.divide(tf.reduce_sum(tf.square(tf.subtract(y_, y_conv)), axis=1), org_loss))
+
+prediction = y_conv
+
 for i in range(ITERS+1):
     batch = next_batch(BATCH)
     if i%BATCH == 0:
@@ -178,11 +227,15 @@ for i in range(ITERS+1):
             print("done")
             #save_path = saver.save(sess, './interpolation-model')
             #print(save_path)
+    gen = prediction.eval(feed_dict={x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
+        x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)), keep_prob: 1.0}, session=sess)
     train_step.run(feed_dict={x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
         y_: np.reshape(batch['y'], (BATCH, OUTPUT_DIM)), org_loss: np.reshape(batch['org_l'], (BATCH, 1)), 
-        x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)), keep_prob: 0.9})
+        x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)), keep_prob: 0.9, x: gen, y_class: })
+    train_step_d.run(feed_dict={x: gen, y_class: })
+    train_step_d.run(feed_dict={x: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)). y_class: })
     
-prediction = y_conv
+
 
 for j in range(len(shist[0])):
     resultimg = np.reshape(np.array(prediction.eval(feed_dict={x_s: np.reshape(shist[0][j], (1, INPUT_DIM)), 
