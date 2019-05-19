@@ -1,35 +1,32 @@
-from __future__ import division
 import tensorflow as tf
 import math
 import numpy as np
 import png
-from scipy import misc
-from queue import PriorityQueue
+from matplotlib.pyplot import imread
 import random
 import pflow
+import sys
 
-imagelist = []
-with open('imagelist.txt', 'r') as f:
-    imagelist = f.readlines()
-imagelist = [im.strip() for im in imagelist]
 
 WIDTH = 320
 HEIGHT = 180
-
 INPUT_DIM = WIDTH*HEIGHT
 OUTPUT_DIM = INPUT_DIM
 BATCH = 4
 ITERS = 2048
-
-current = 0
-
-rerun = 0
-shist = [[], [], [], []]
-
-NSIZE = 3
+NSIZE = 5 # Window size of optical flow for Lucas-Kanade
+GEN_LEARN = 0.001
+DISC_LEARN = 0.001
 
 w = png.Writer(WIDTH, HEIGHT, greyscale=True)
-np.set_printoptions(threshold=np.nan)
+np.set_printoptions(threshold=sys.maxsize)
+
+def read_imagelist(filename):
+    imagelist = []
+    with open(filename, 'r') as f:
+        imagelist = f.readlines()
+    imagelist = [im.strip() for im in imagelist]
+    return imagelist
 
 def gray(img):
     return 0.2989*img[:,:,0] + 0.587*img[:,:,1] + 0.114*img[:,:,2]
@@ -42,41 +39,25 @@ def binary(img):
 def hex(img):
     return np.clip(0, np.multiply(img, 255), 255)
 
-for i in range(0, len(imagelist), 3):
-    imstart = np.array(misc.imread(imagelist[i]))
-    imend = np.array(misc.imread(imagelist[i+2]))
-    imbetween = np.array(misc.imread(imagelist[i+1]))
-    
-    imstart = gray(imstart)
-    imend = gray(imend)
-    imbetween = gray(imbetween)
-    flow = pflow.optical_flow(imstart, imend, NSIZE)
+def read_images(imagelist):
+    img_data = {"starts": [], "ends": [], "betweens": [], "diffs": [], "flows": []}
 
-    #with open(str(i/3+1) + '-flow.png', 'wb+') as f:
-    #    w.write(f, np.reshape(pflow.flow_conversion(imstart, flow), (-1, WIDTH*1)))
+    for i in range(0, len(imagelist), 3):
+        imstart = np.array(imread(imagelist[i]))
+        imend = np.array(imread(imagelist[i+2]))
+        imbetween = np.array(imread(imagelist[i+1]))
+        
+        imstart = gray(imstart)
+        imend = gray(imend)
+        imbetween = gray(imbetween)
+        flow = pflow.optical_flow(imstart, imend, NSIZE)
 
-    #shist[0].append(flow_conversion(np.subtract(imend, imstart), flow))
-    #shist[0].append(np.concatenate((imstart[...,np.newaxis], imend[...,np.newaxis]), axis=2))
-    shist[0].append(pflow.flow_conversion(imstart, flow))
-    shist[1].append(imend)
-    shist[2].append(imbetween)
-    #shist[2].append(flow)
-    shist[3].append(np.sum(np.square(np.subtract(imend, imstart))))
-
-"""
-for j in range(len(shist[0])):
-    #resultimg = np.add(shist[2][j], shist[1][j])
-    resultimg = hex(shist[2][j])
-    resultimg = np.clip(resultimg, 0, 255).astype(int)
-    with open(str(j+1) + '.png', 'wb+') as f:
-        w.write(f, np.reshape(resultimg, (-1, WIDTH*1)))
-"""
-
-x_s = tf.placeholder(tf.float32, shape=[None, INPUT_DIM])
-x_e = tf.placeholder(tf.float32, shape=[None, INPUT_DIM])
-y_ = tf.placeholder(tf.float32, shape=[None, OUTPUT_DIM])
-flow = tf.placeholder(tf.int32, shape=[None, HEIGHT, WIDTH])
-org_loss = tf.placeholder(tf.float32, shape=[BATCH, 1])
+        img_data["starts"].append(imstart)
+        img_data["ends"].append(imend)
+        img_data["betweens"].append(imbetween)
+        img_data["diffs"].append(np.sum(np.square(np.subtract(imend, imstart))))
+        img_data["flows"].append(flow)
+    return img_data
 
 def weight_variable(shape):
     initial = tf.truncated_normal(shape, stddev=0.1)
@@ -95,152 +76,224 @@ def deconv2d(x, W, shape):
 def max_pool_2x2(x):
     return tf.nn.max_pool(x, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
 
-def next_batch(size):
-    indices = random.sample(range(len(shist[0])), size)
+def next_batch(img_data, size):
+    indices = random.sample(range(len(img_data["starts"])), size)
     x_s = []
     x_e = []
     y = []
     org_l = []
+    flows = []
     for index in indices:
-        x_s.append(shist[0][index])
-        x_e.append(shist[1][index])
-        y.append(shist[2][index])
-        org_l.append(shist[3][index])
-    return {'x_s': np.array(x_s, dtype=object), 'x_e': np.array(x_e, dtype=object), 
-    'y': np.array(y, dtype=object), 'org_l': np.array(org_l)}
+        x_s.append(img_data["starts"][index])
+        x_e.append(img_data["ends"][index])
+        y.append(img_data["betweens"][index])
+        org_l.append(img_data["diffs"][index])
+        flows.append(img_data["flows"][index])
+    return {
+        'x_s': np.array(x_s, dtype=object),
+        'x_e': np.array(x_e, dtype=object),
+        'y': np.array(y, dtype=object),
+        'org_l': np.array(org_l),
+        'flows': np.array(flows)
+    }
 
-W_conv0 = weight_variable([5, 5, 1, 8])
-b_conv0 = bias_variable([8])
-x_l = tf.reshape(x_s, [-1, HEIGHT, WIDTH, 1])
-x_r = tf.reshape(x_e, [-1, HEIGHT, WIDTH, 1])
-h_conv0_l = tf.nn.relu(conv2d(x_l, W_conv0) + b_conv0)
-h_pool0_l = max_pool_2x2(h_conv0_l)
-h_conv0_r = tf.nn.relu(conv2d(x_r, W_conv0) + b_conv0)
-h_pool0_r = max_pool_2x2(h_conv0_r)
+def make_labels(size, label):
+    to_return = np.zeros((size, 2))
+    to_return[:, label] = 1
+    return to_return
 
-W_conv1 = weight_variable([3, 3, 8, 64])
-b_conv1 = bias_variable([64])
-h_conv1_l = tf.nn.relu(conv2d(h_pool0_l, W_conv1) + b_conv1)
-h_pool1_l = max_pool_2x2(h_conv1_l)
-h_conv1_r = tf.nn.relu(conv2d(h_pool0_r, W_conv1) + b_conv1)
-h_pool1_r = max_pool_2x2(h_conv1_r)
+def train(img_data, is_rerun):
+    x_s = tf.placeholder(tf.float32, shape=[None, INPUT_DIM], name='x_s')
+    x_e = tf.placeholder(tf.float32, shape=[None, INPUT_DIM], name='x_e')
+    y_ = tf.placeholder(tf.float32, shape=[None, OUTPUT_DIM], name='y_')
+    flow = tf.placeholder(tf.int32, shape=[None, HEIGHT, WIDTH, 2], name='flow')
+    org_loss = tf.placeholder(tf.float32, shape=[BATCH, 1], name='org_loss')
+    keep_prob = tf.placeholder(tf.float32, name='keep_prob')
 
-W_conv2 = weight_variable([3, 3, 64, 128])
-b_conv2 = bias_variable([128])
-h_conv2_l = tf.nn.relu(conv2d(h_pool1_l, W_conv2) + b_conv2)
-h_conv2_r = tf.nn.relu(conv2d(h_pool1_r, W_conv2) + b_conv2)
+    W_conv0 = weight_variable([5, 5, 1, 8])
+    b_conv0 = bias_variable([8])
+    x_l = tf.reshape(x_s, [-1, HEIGHT, WIDTH, 1])
+    x_r = tf.reshape(x_e, [-1, HEIGHT, WIDTH, 1])
+    h_conv0_l = tf.nn.relu(conv2d(x_l, W_conv0) + b_conv0)
+    h_conv0_l_flow = tf.expand_dims(tf.gather_nd(h_conv0_l[0], flow[0]), 0)
+    for i in range(1, BATCH):
+        h_conv0_l_flow = tf.concat([h_conv0_l_flow, tf.expand_dims(tf.gather_nd(h_conv0_l[i], flow[i]), 0)], 0)
+    h_pool0_l = max_pool_2x2(h_conv0_l_flow)
+    h_conv0_r = tf.nn.relu(conv2d(x_r, W_conv0) + b_conv0)
+    h_pool0_r = max_pool_2x2(h_conv0_r)
 
+    W_conv1 = weight_variable([3, 3, 8, 64])
+    b_conv1 = bias_variable([64])
+    h_conv1_l = tf.nn.relu(conv2d(h_pool0_l, W_conv1) + b_conv1)
+    h_pool1_l = max_pool_2x2(h_conv1_l)
+    h_conv1_r = tf.nn.relu(conv2d(h_pool0_r, W_conv1) + b_conv1)
+    h_pool1_r = max_pool_2x2(h_conv1_r)
 
-h_conv3 = h_conv2_l + h_conv2_r
+    W_conv2 = weight_variable([3, 3, 64, 128])
+    b_conv2 = bias_variable([128])
+    h_conv2_l = tf.nn.relu(conv2d(h_pool1_l, W_conv2) + b_conv2)
+    h_conv2_r = tf.nn.relu(conv2d(h_pool1_r, W_conv2) + b_conv2)
 
-W_deconv0 = weight_variable([3, 3, 64, 128])
-b_deconv0 = bias_variable([64])
-h_deconv0 = tf.nn.relu(deconv2d(h_conv3, W_deconv0, [tf.shape(x_l)[0], int(HEIGHT/4), int(WIDTH/4), 64]) + b_deconv0)
+    h_conv3 = h_conv2_l + h_conv2_r
 
-W_deconv1 = weight_variable([3, 3, 8, 64])
-b_deconv1 = bias_variable([8])
-h_deconv1 = tf.nn.relu(deconv2d(h_deconv0, W_deconv1, [tf.shape(x_l)[0], int(HEIGHT/4), int(WIDTH/4), 8]) + b_deconv1)
-h_depool1 = tf.image.resize_images(h_deconv1, [int(HEIGHT/2), int(WIDTH/2)])
+    W_deconv0 = weight_variable([3, 3, 64, 128])
+    b_deconv0 = bias_variable([64])
+    h_deconv0 = tf.nn.relu(deconv2d(h_conv3, W_deconv0, [tf.shape(x_l)[0], int(HEIGHT/4), int(WIDTH/4), 64]) + b_deconv0)
 
-W_deconv2 = weight_variable([5, 5, 1, 8])
-b_deconv2 = bias_variable([1])
-h_deconv2 = tf.nn.relu(deconv2d(h_depool1, W_deconv2, [tf.shape(x_l)[0], int(HEIGHT/2), int(WIDTH/2), 1]) + b_deconv2)
-h_depool2 = tf.image.resize_images(h_deconv2, [HEIGHT, WIDTH])
+    W_deconv1 = weight_variable([3, 3, 8, 64])
+    b_deconv1 = bias_variable([8])
+    h_deconv1 = tf.nn.relu(deconv2d(h_deconv0, W_deconv1, [tf.shape(x_l)[0], int(HEIGHT/4), int(WIDTH/4), 8]) + b_deconv1)
+    h_depool1 = tf.image.resize_images(h_deconv1, [int(HEIGHT/2), int(WIDTH/2)])
 
-#W_deconv3 = weight_variable([3, 3, 1, 1])
-#b_deconv3 = bias_variable([1])
-#h_deconv3 = tf.nn.relu(deconv2d(h_depool2, W_deconv3, [tf.shape(x_features)[0], HEIGHT, WIDTH, 1]) + b_deconv3)
+    W_deconv2 = weight_variable([5, 5, 1, 8])
+    b_deconv2 = bias_variable([1])
+    h_deconv2 = tf.nn.relu(deconv2d(h_depool1, W_deconv2, [tf.shape(x_l)[0], int(HEIGHT/2), int(WIDTH/2), 1]) + b_deconv2)
+    h_depool2 = tf.image.resize_images(h_deconv2, [HEIGHT, WIDTH])
 
-W_reconv0 = weight_variable([3, 3, 1, 1])
-b_reconv0 = bias_variable([1])
-y_conv = tf.reshape(tf.nn.relu(conv2d(h_depool2, W_reconv0) + b_reconv0), [-1, OUTPUT_DIM])
+    #W_deconv3 = weight_variable([3, 3, 1, 1])
+    #b_deconv3 = bias_variable([1])
+    #h_deconv3 = tf.nn.relu(deconv2d(h_depool2, W_deconv3, [tf.shape(x_features)[0], HEIGHT, WIDTH, 1]) + b_deconv3)
 
-keep_prob = tf.placeholder(tf.float32)
+    W_reconv0 = weight_variable([3, 3, 1, 1])
+    b_reconv0 = bias_variable([1])
+    y_conv = tf.reshape(tf.nn.relu(conv2d(h_depool2, W_reconv0) + b_reconv0), [-1, OUTPUT_DIM], name='y_conv')
 
-loss = tf.reduce_mean(tf.divide(tf.reduce_sum(tf.square(tf.subtract(y_, y_conv)), axis=1), org_loss))
-
-
-#Discriminator network
-x = tf.placeholder(tf.float32, shape=[None, INPUT_DIM])
-#binary classification
-y_class = tf.placeholder(tf.float32, shape=[None, 2])
-
-W_d_conv0 = weight_variable([5, 5, 1, 8])
-b_d_conv0 = bias_variable([8])
-
-h_d_conv0 = tf.nn.relu(conv2d(x, W_d_conv0) + b_d_conv0)
-h_d_pool0 = max_pool_2x2(h_d_conv0)
-
-W_d_conv1 = weight_variable([3, 3, 8, 16])
-b_d_conv1 = bias_variable([16])
-
-h_d_conv1 = tf.nn.relu(conv2d(h_d_pool0, W_d_conv1) + b_d_conv1)
-h_d_pool1 = max_pool_2x2(h_d_conv1)
-
-W_d_conv2 = weight_variable([3, 3, 16, 32])
-b_d_conv2 = bias_variable([32])
-
-h_d_conv2 = tf.nn.relu(conv2d(h_d_pool1, W_d_conv2) + b_d_conv2)
-
-h_d_r = tf.reshape(h_d_conv2, [-1, WIDTH/4 * HEIGHT/4 * 32])
-W_d_fc0 = weight_variable([WIDTH/4 * HEIGHT/4 * 32, 1024])
-b_d_fc0 = bias_variable([1024])
-
-h_d_fc0 = tf.nn.relu(tf.matmul(h_d_r, W_d_fc0) + b_d_fc0)
-
-W_d_fc1 = weight_variable([1024, 2])
-b_d_fc1 = bias_variable([2])
-
-out = tf.matmul(h_d_fc0, W_d_fc1) + b_d_fc1
-
-#discriminator loss
-cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_class, logits=out))
-train_step_d = tf.train.AdamOptimizer(0.001).minimize(cross_entropy)
-
-#generator loss with discriminator loss included
-loss_with_d = loss - 0.2*cross_entropy
-train_step = tf.train.AdamOptimizer(0.001).minimize(loss)
+    loss = tf.reduce_mean(tf.divide(tf.reduce_sum(tf.square(tf.subtract(y_, y_conv)), axis=1), org_loss))*10
 
 
-sess = tf.InteractiveSession()
-saver = tf.train.Saver()
+    #Discriminator network
+    x = tf.placeholder(tf.float32, shape=[None, INPUT_DIM])
+    #binary classification
+    y_class = tf.placeholder(tf.float32, shape=[None, 2])
+    #If 1, then training generator, if 0, training discriminator
+    train_type = tf.placeholder(tf.float32, shape=[None, 1])
+    #Use y_conv if training generator, x if training discriminator
+    true_input = x*(1 - train_type) + y_conv*train_type
 
-if rerun == 0:
-    sess.run(tf.global_variables_initializer())
-if rerun == 1:
-    saver.restore(sess, 'interpolation-model')
-    print("Model restored")
+    W_d_conv0 = weight_variable([5, 5, 1, 8])
+    b_d_conv0 = bias_variable([8])
+
+    h_d_conv0 = tf.nn.relu(conv2d(tf.reshape(true_input, [-1, HEIGHT, WIDTH, 1]), W_d_conv0) + b_d_conv0)
+    h_d_pool0 = max_pool_2x2(h_d_conv0)
+
+    W_d_conv1 = weight_variable([3, 3, 8, 16])
+    b_d_conv1 = bias_variable([16])
+
+    h_d_conv1 = tf.nn.relu(conv2d(h_d_pool0, W_d_conv1) + b_d_conv1)
+    h_d_pool1 = max_pool_2x2(h_d_conv1)
+
+    W_d_conv2 = weight_variable([3, 3, 16, 32])
+    b_d_conv2 = bias_variable([32])
+
+    h_d_conv2 = tf.nn.relu(conv2d(h_d_pool1, W_d_conv2) + b_d_conv2)
+
+    h_d_r = tf.reshape(h_d_conv2, [-1, int(WIDTH/4 * HEIGHT/4 * 32)])
+    W_d_fc0 = weight_variable([int(WIDTH/4 * HEIGHT/4 * 32), 512])
+    b_d_fc0 = bias_variable([512])
+
+    h_d_fc0 = tf.nn.relu(tf.matmul(h_d_r, W_d_fc0) + b_d_fc0)
+
+    W_d_fc1 = weight_variable([512, 2])
+    b_d_fc1 = bias_variable([2])
+
+    out = tf.matmul(h_d_fc0, W_d_fc1) + b_d_fc1
+
+    #discriminator loss
+    cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_class, logits=out))
+    train_step_d = tf.train.AdamOptimizer(DISC_LEARN).minimize(cross_entropy, var_list=[W_d_conv0, b_d_conv0, 
+        W_d_conv1, b_d_conv1, W_d_conv2, b_d_conv2, W_d_fc0, b_d_fc0, W_d_fc1, b_d_fc1])
+
+    #generator loss with discriminator loss included
+    loss_with_d = loss - 3*cross_entropy
+    train_step = tf.train.AdamOptimizer(GEN_LEARN).minimize(loss_with_d, var_list=[W_conv0, b_conv0, 
+        W_conv1, b_conv1, W_conv2, b_conv2, W_deconv0, b_deconv0, W_deconv1, b_deconv1, 
+        W_deconv2, b_deconv2, W_reconv0, b_reconv0])
 
 
-accuracy = tf.reduce_mean(tf.divide(tf.reduce_sum(tf.square(tf.subtract(y_, y_conv)), axis=1), org_loss))
+    sess = tf.InteractiveSession()
+    saver = tf.train.Saver()
 
-prediction = y_conv
+    if is_rerun:
+        saver.restore(sess, './models/interpolation-model')
+        print("Model restored")
+    else:
+        sess.run(tf.global_variables_initializer())
 
-for i in range(ITERS+1):
-    batch = next_batch(BATCH)
-    if i%BATCH == 0:
-        train_accuracy = accuracy.eval(feed_dict={x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
-            y_: np.reshape(batch['y'], (BATCH, OUTPUT_DIM)), org_loss: np.reshape(batch['org_l'], (BATCH, 1)), 
-            x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)), keep_prob: 1.0})
-        print("step %d, training error %g"%(i, train_accuracy))
-        if rerun == 0 and i == ITERS:
-            print("done")
-            #save_path = saver.save(sess, './interpolation-model')
-            #print(save_path)
-    gen = prediction.eval(feed_dict={x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
-        x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)), keep_prob: 1.0}, session=sess)
-    train_step.run(feed_dict={x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
-        y_: np.reshape(batch['y'], (BATCH, OUTPUT_DIM)), org_loss: np.reshape(batch['org_l'], (BATCH, 1)), 
-        x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)), keep_prob: 0.9, x: gen, y_class: })
-    train_step_d.run(feed_dict={x: gen, y_class: })
-    train_step_d.run(feed_dict={x: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)). y_class: })
-    
+    accuracy = tf.reduce_mean(tf.divide(tf.reduce_sum(tf.square(tf.subtract(y_, y_conv)), axis=1), org_loss))
 
+    prediction = y_conv
 
-for j in range(len(shist[0])):
-    resultimg = np.reshape(np.array(prediction.eval(feed_dict={x_s: np.reshape(shist[0][j], (1, INPUT_DIM)), 
-        x_e: np.reshape(shist[1][j], (1, INPUT_DIM)), keep_prob: 1.0}, session=sess)), (HEIGHT, WIDTH))
-    resultimg = np.clip(resultimg, 0, 255).astype(int)
-    with open(str(j+1) + '.png', 'wb+') as f:
-        w.write(f, np.reshape(resultimg, (-1, WIDTH)))
-    print(j)
+    for i in range(ITERS+1):
+        batch = next_batch(img_data, BATCH)
+        if i % BATCH == 0:
+            train_accuracy = accuracy.eval(feed_dict={
+                x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
+                y_: np.reshape(batch['y'], (BATCH, OUTPUT_DIM)),
+                org_loss: np.reshape(batch['org_l'], (BATCH, 1)), 
+                x_e: np.reshape(batch['x_e'],(BATCH, INPUT_DIM)),
+                flow: batch['flows'],
+                keep_prob: 1.0})
+            print("step %d, training error %g" % (i, train_accuracy))
+            if not is_rerun and i == ITERS:
+                print("done")
+                #save_path = saver.save(sess, './models/interpolation-model')
+                #print(save_path)
+        gen = prediction.eval(feed_dict={
+            x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)),
+            x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)),
+            flow: batch['flows'],
+            keep_prob: 1.0
+        })
+        train_step.run(feed_dict={
+            x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)),
+            y_: np.reshape(batch['y'], (BATCH, OUTPUT_DIM)),
+            org_loss: np.reshape(batch['org_l'], (BATCH, 1)),
+            x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)),
+            flow: batch['flows'],
+            keep_prob: 0.9, 
+            y_class: make_labels(BATCH, 1),
+            x: gen, 
+            train_type: np.ones((BATCH, 1))
+        })
+        train_step_d.run(feed_dict={
+            x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
+            x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)),
+            x: gen,
+            flow: batch['flows'],
+            y_class: make_labels(BATCH, 1),
+            train_type: np.zeros((BATCH, 1))
+        })
+        train_step_d.run(feed_dict={
+            x_s: np.reshape(batch['x_s'], (BATCH, INPUT_DIM)), 
+            x_e: np.reshape(batch['x_e'], (BATCH, INPUT_DIM)),
+            x: np.reshape(batch['y'], (BATCH, INPUT_DIM)),
+            flow: batch['flows'],
+            y_class: make_labels(BATCH, 0),
+            train_type: np.zeros((BATCH, 1))
+        })
+        
+
+    for j in range(len(img_data["starts"])):
+        resultimg = np.reshape(
+            np.array(
+                prediction.eval(
+                    feed_dict={
+                        x_s: np.repeat(np.reshape(img_data["starts"][j], (1, INPUT_DIM)), BATCH, axis=0), 
+                        x_e: np.repeat(np.reshape(img_data["ends"][j], (1, INPUT_DIM)), BATCH, axis=0),
+                        flow: np.repeat(img_data["flows"][j][np.newaxis, ...], BATCH, axis=0),
+                        keep_prob: 1.0
+                    },
+                    session=sess
+                )
+            )[0],
+            (HEIGHT, WIDTH)
+        )
+        resultimg = np.clip(resultimg, 0, 255).astype(int)
+        with open(str(j+1) + '.png', 'wb+') as f:
+            w.write(f, np.reshape(resultimg, (-1, WIDTH)))
+        print(j)
+
+if __name__ == "__main__":
+    imagelist = read_imagelist(sys.argv[1])
+    img_data = read_images(imagelist)
+    train(img_data, False)

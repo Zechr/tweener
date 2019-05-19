@@ -1,16 +1,17 @@
 import numpy as np
 import scipy
 import scipy.ndimage
+import scipy.stats as st
 
 sobel_u = np.array([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
 sobel_v = np.array([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]])
 
-def gaussian(size, sigma):
-     #m,n = size
-     #h, k = m//2, n//2
-     #x, y = np.mgrid[-m:m, -n:n]
-     #return np.exp(-(x**2 + y**2)/(2*sigma**2))
-     return np.array([[0.25, 0.5, 0.25], [0.5, 1.0, 0.5], [0.25, 0.5, 0.25]])
+def gaussian(size):
+    lim = size // 2 + (size % 2) / 2
+    x = np.linspace(-lim, lim, size + 1)
+    kern1d = np.diff(st.norm.cdf(x))
+    kern2d = np.outer(kern1d, kern1d)
+    return kern2d / kern2d.sum()
 
 def optical_flow(img1, img2, window):
 	diff = np.subtract(img1, img2)
@@ -21,32 +22,27 @@ def optical_flow(img1, img2, window):
 	xy = np.multiply(x_grad, y_grad)
 	xt = np.multiply(x_grad, diff)
 	yt = np.multiply(y_grad, diff)
-	filt = gaussian((window, window), 0.8)
+	filt = gaussian(window)
 	xx = scipy.ndimage.filters.convolve(xx, filt, mode='constant')
 	yy = scipy.ndimage.filters.convolve(yy, filt, mode='constant')
 	xy = scipy.ndimage.filters.convolve(xy, filt, mode='constant')
 	xt = np.multiply(scipy.ndimage.filters.convolve(xt, filt, mode='constant'), -1.0)
 	yt = np.multiply(scipy.ndimage.filters.convolve(yt, filt, mode='constant'), -1.0)
 	toReturn = np.zeros((np.shape(img1)[0], np.shape(img1)[1], 2))
+	count = 0
 	for i in range(np.shape(img1)[0]):
 		for j in range(np.shape(img1)[1]):
-			if xx[i, j]*yy[i, j] - xy[i, j]**2 == 0:
+			h = np.array([[xx[i, j], xy[i, j]], [xy[i, j], yy[i, j]]])
+			try:
+				h = np.linalg.inv(h)
+			except np.linalg.LinAlgError:
 				toReturn[i, j, 0] = 0
 				toReturn[i, j, 1] = 0
-				continue
-			h = np.array([[xx[i, j], xy[i, j]], [xy[i, j], yy[i, j]]])
-			h = np.linalg.inv(h)
+				count += 1
 			tderv = np.reshape(np.array([xt[i, j], yt[i, j]]), (2, 1))
 			flowv = np.squeeze(np.dot(h, tderv))
-			toReturn[i, j, 0] = int(flowv[0])
-			toReturn[i, j, 1] = int(flowv[1])
-	return toReturn
-
-def flow_conversion(img, flow):
-	toReturn = np.zeros((np.shape(img)[0], np.shape(img)[1]))
-	for i in range(np.shape(img)[0]):
-		for j in range(np.shape(img)[1]):
-			newi = min(max(i + int(flow[i, j, 1]), 0), np.shape(img)[0] - 1)
-			newj = min(max(j + int(flow[i, j, 0]), 0), np.shape(img)[1] - 1)
-			toReturn[i, j] = img[newi, newj]
+			# The new positions of each pixel
+			toReturn[i, j, 0] = min(max(i + int(flowv[1]), 0), np.shape(img1)[0] - 1)
+			toReturn[i, j, 1] = min(max(j + int(flowv[0]), 0), np.shape(img1)[1] - 1)
+	print(count)
 	return toReturn
